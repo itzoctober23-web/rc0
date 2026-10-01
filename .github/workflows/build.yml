@@ -1,0 +1,97 @@
+# Builds the engine and the client for Windows and Linux on every push; on a v* tag it publishes a release
+# with ready-to-run downloads (no compiler or Python needed by contributors).
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ORT_VERSION: "1.20.1"
+  DML_VERSION: "1.15.2"
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: ONNX Runtime (CUDA build; falls back to the CPU when CUDA is not installed)
+        run: curl -sSL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz | tar xz -C "$RUNNER_TEMP"
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRC0_NATIVE=OFF -DRC0_TORCH=OFF -DRC0_TRT=OFF -DONNXRUNTIME_DIR="$RUNNER_TEMP/onnxruntime-linux-x64-gpu-${ORT_VERSION}"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Package
+        run: |
+          D=dist/rc0-linux-x64
+          mkdir -p $D
+          cp build/rc0 client/rc0_client.py LICENSE $D/
+          cp -P "$RUNNER_TEMP"/onnxruntime-linux-x64-gpu-${ORT_VERSION}/lib/libonnxruntime*.so* $D/
+          cp docs/CONTRIBUTE.md $D/README.md
+          tar czf dist/rc0-linux-x64.tar.gz -C dist rc0-linux-x64
+          ./$D/rc0 validate /nonexistent || true   # smoke: the binary starts and finds its libraries
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rc0-linux-x64
+          path: dist/rc0-linux-x64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ONNX Runtime with DirectML (works on any DirectX 12 GPU) + DirectML
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/$env:ORT_VERSION" -OutFile ort.zip
+          Expand-Archive ort.zip -DestinationPath "$env:RUNNER_TEMP/ort"
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/$env:DML_VERSION" -OutFile dml.zip
+          Expand-Archive dml.zip -DestinationPath "$env:RUNNER_TEMP/dml"
+      - name: Configure
+        run: cmake -S . -B build -DRC0_NATIVE=OFF -DRC0_TORCH=OFF -DRC0_TRT=OFF "-DONNXRUNTIME_DIR=${{ runner.temp }}/ort"
+      - name: Build
+        run: cmake --build build --config Release -j 4
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Client executable
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --name rc0-client client/rc0_client.py
+      - name: Package
+        shell: pwsh
+        run: |
+          $D = "dist/rc0-windows-x64"
+          New-Item -ItemType Directory -Force $D | Out-Null
+          Copy-Item build/Release/rc0.exe, dist/rc0-client.exe, LICENSE $D
+          Copy-Item "$env:RUNNER_TEMP/ort/runtimes/win-x64/native/*.dll" $D
+          Copy-Item "$env:RUNNER_TEMP/dml/bin/x64-win/DirectML.dll" $D
+          Copy-Item docs/CONTRIBUTE.md "$D/README.md"
+          & "$D/rc0.exe" validate nonexistent; $global:LASTEXITCODE = 0   # smoke: starts and finds its DLLs
+          Compress-Archive -Path $D -DestinationPath dist/rc0-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rc0-windows-x64
+          path: dist/rc0-windows-x64.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

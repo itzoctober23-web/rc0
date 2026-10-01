@@ -2,7 +2,10 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include "position.h"
 namespace zero {
+// final material balance, Red+Yellow minus Blue+Green, pawn units (P1 N3 B5 R5 Q9), clamped to int8
+int8_t material_ry(const quad::Position& p);
 struct SelfplayOpts {
     std::string net, out;
     int games = 100, threads = 32, playouts = 128, maxPlies = 600, tempPlies = 20, randomPlies = 8, c960pct = 20;
@@ -20,4 +23,7 @@ struct SelfplayOpts {
     float forcedPlayouts = 0.0f; // the 2.0 in KataGo's n_forced = sqrt(2 * P * N); 0 = off. SELF-PLAY ONLY
 };
 int selfplay_main(const SelfplayOpts& o);
+// Replays every game in a self-play directory and checks every recorded row against the rules (validate.cpp).
+// gamesOnly: games.txt alone (match games, no training rows); every game must be played to its end or the ply cap.
+int validate_main(const std::string& dir, bool verbose, bool gamesOnly = false);
 }

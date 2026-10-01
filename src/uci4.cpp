@@ -174,7 +174,7 @@ void uci4_loop(EngineOptions opts) {
             std::getline(is, value);
             if (!value.empty() && value[0] == ' ') value.erase(0, 1);
             if (name == "Net") {
-                auto e = make_torch_evaluator(value, 256);
+                auto e = make_evaluator(value, 256);
                 if (e) { ev = std::move(e); opts.netPath = value; cache = std::make_unique<CachedEvaluator>(*ev, 18); reset_tree(); out("info string loaded " + value); }
                 else out("info string failed to load " + value);
             } else if (name == "Playouts") opts.playoutsCap = std::atoi(value.c_str());

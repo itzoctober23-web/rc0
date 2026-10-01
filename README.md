@@ -8,9 +8,9 @@ knows, it learned by playing against itself.
 The goal is the same as Lc0's. Anyone with a GPU should be able to help train it, and the networks, code and
 training data stay open.
 
-> Status: early. One machine trains it today (an RTX-class consumer GPU). The code here is that pipeline.
-> The next milestone is the **distributed client/server**, so other people's GPUs can add self-play games
-> (see [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md)).
+> **Help train it:** download the client for Windows or Linux from the
+> [releases page](https://github.com/itzoctober23-web/rc0/releases/latest) and see [docs/CONTRIBUTE.md](docs/CONTRIBUTE.md).
+> It runs on NVIDIA, AMD and Intel GPUs (DirectML on Windows, CUDA on Linux), and needs no compiler or Python on Windows.
 
 ## The game
 
@@ -28,8 +28,9 @@ self-play.
 | Part | What it is |
 |---|---|
 | `rules/` | Board, move generation, check, mate, stalemate, repetition and 50-move rules. No search, no evaluation. Verified by perft and by a move-for-move comparison against an independent implementation on more than 15 million positions. |
-| `src/` | The engine: input encoding, batched MCTS (PUCT for play, Gumbel for self-play), certainty propagation, NN cache, LibTorch and TensorRT backends, a UCI-style protocol for 4 players (`uci4`), and the self-play generator. |
+| `src/` | The engine: input encoding, batched MCTS (PUCT for play, Gumbel for self-play), certainty propagation, NN cache, ONNX Runtime (portable), LibTorch and TensorRT backends, a UCI-style protocol for 4 players (`uci4`), the self-play generator and `rc0 validate`, which replays and checks uploaded games. |
 | `train/` | PyTorch network (residual tower with squeeze-excitation; policy, WDL value, moves-left and auxiliary heads) and the self-play trainer. |
+| `client/`, `server/` | Distributed training, Lc0-style: contributors' clients play the games, the server checks every upload, trains, and gates new networks ([docs/DISTRIBUTED.md](docs/DISTRIBUTED.md)). |
 | `scripts/` | The single-machine loop: generate games → retrain on a sliding window → new generation. |
 | `docs/` | Rules, architecture, the training recipe and the distributed design. |
 
@@ -39,8 +40,13 @@ KataGo (Wu, 2019, *Accelerating Self-Play Learning in Go*) and Lc0. Where a sett
 
 ## Building
 
-Requirements: Linux, CMake ≥ 3.20, a C++20 compiler, Python ≥ 3.10 with PyTorch (CUDA build) for the GPU
-backend and for training. TensorRT is optional and about 2× faster for self-play.
+Contributors don't need to build anything; the [releases](https://github.com/itzoctober23-web/rc0/releases/latest)
+have ready-to-run Windows and Linux downloads. To build it yourself you need CMake ≥ 3.20 and a C++20 compiler
+(GCC, Clang or MSVC), plus one or more backends:
+
+- **ONNX Runtime** (portable: Windows/Linux, CUDA, DirectML or CPU): `-DONNXRUNTIME_DIR=<unpacked onnxruntime release>`
+- **LibTorch** (Linux; the training machine): found automatically from `pip install torch`
+- **TensorRT** (optional, about 2× faster self-play on NVIDIA)
 
 ```bash
 git clone https://github.com/itzoctober23-web/rc0
@@ -62,13 +68,14 @@ build/rc0 selfplay --net net.pt --out games/ --threads 256 --playouts 600 --fast
 python3 train/train_selfplay.py --init net.pt --data games/ --out train_out/
 ```
 
-`scripts/selfplay.sh` and `scripts/train_cycle.sh` run the complete loop on one machine.
+`scripts/selfplay.sh` and `scripts/train_cycle.sh` run the complete loop on one machine;
+`server/rc0_server.py` and `client/rc0_client.py` run it across many machines.
 
 ## Contributing
 
 The most useful contributions right now:
 
-1. **The distributed client and server** (Lc0-style, see [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md)).
+1. **Run the client** and lend your GPU ([docs/CONTRIBUTE.md](docs/CONTRIBUTE.md)).
 2. **Rules and protocol checks.** If you have another 4PC Teams implementation, compare perft and game results with ours.
 3. **Testing nets.** Play them and report positions where they go wrong, especially turn-order mates.
 

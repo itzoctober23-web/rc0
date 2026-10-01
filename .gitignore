@@ -7,3 +7,4 @@ runs/
 *.plan.meta
 __pycache__/
 *.pyc
+.deps/

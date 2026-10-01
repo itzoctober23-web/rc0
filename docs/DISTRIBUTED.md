@@ -1,69 +1,75 @@
-# Distributed training (design)
+# Distributed training
 
-The goal is to let anyone with a GPU contribute self-play games, the same way Lc0 does. One server trains the
-network; many clients generate the games. This page is the design. The implementation is the next milestone.
-
-## How Lc0 does it
-
-- A **server** hosts the current network, hands out work, collects games and runs the trainer.
-- A **client** (`lc0-client`) downloads the newest network, runs the engine in self-play mode, and uploads the
-  training data and a game record. It runs unattended and updates itself to new networks.
-- **Test matches** between networks run on clients too, and give the published Elo graph.
-
-Rc0 copies this structure.
-
-## Components
+Like Lc0, one server trains the network and many contributors' GPUs generate the games.
+Contributors only need the release download; see [CONTRIBUTE.md](CONTRIBUTE.md).
 
 ```
-            ┌──────────────────────────── server ────────────────────────────┐
- client ──► │  API  ──►  validator  ──►  chunk store  ──►  trainer (GPU)       │
- client ──► │   │                                             │                │
- client ──► │   └──── networks (sha256-addressed) ◄───────────┘                │
-            └────────────────────────────────────────────────────────────────┘
+ client ──┐   GET  /api/task            self-play task (current network) or gate match task
+ client ──┼─► GET  /networks/<sha>.onnx  network download, checked by SHA-256
+ client ──┘   POST /api/upload|match    results ──► rc0 validate ──► data/gen<N>/ ──► trainer ──► candidate ──► gate
 ```
 
-### Client (`client/rc0_client.py`, planned)
+## Client (`client/rc0_client.py`, `rc0-client.exe` on Windows)
 
-A loop with no interaction needed:
+The client runs this loop without anyone watching:
 
-1. `GET /api/task`: the server returns either a **self-play** task (network sha256, playouts, number of games,
-   engine version) or a **match** task (two networks and opening seeds).
-2. Download the network if it is not already cached, and check its sha256.
-3. Run `rc0 selfplay --net … --games N --out tmp/` with the server's settings. The user only chooses the GPU
-   and how many CPU threads to use.
-4. Upload the chunk (the `sp_*.bin` files plus the move list of every game, compressed) to `POST /api/games`.
-5. Repeat. A new network is picked up at the next task.
+1. It asks for a task. The server's answer is either a **self-play** task (a network, the self-play settings
+   and a game count) or a **match** task (a candidate network, the current network, playouts and a seed).
+2. It downloads any network it doesn't have yet and checks its SHA-256.
+3. **Self-play:** it runs `rc0 selfplay` with the server's settings, then checks its own output with
+   `rc0 validate`, then uploads a `.tar.gz` of the output directory.
+4. **Match:** it plays paired games, where each random opening is played twice with the teams swapped, and
+   uploads the move lists.
 
-Clients never choose their own training settings, so all data in a generation is comparable.
+The server chooses every setting except the number of parallel games and the device. That keeps all data in
+a generation comparable.
 
-### Server (`server/`, planned)
+## Server (`server/rc0_server.py`)
 
-- **API:** tasks, network downloads, uploads and a public stats page. Users can create an account with a token.
-- **Validator:** every uploaded game is **replayed through the rules library**. Every recorded move must be
-  legal, the recorded result must equal `game_result()`, and every recorded position must match the replay.
-  A chunk that fails is rejected. A contributor whose uploads keep failing is ignored until reviewed. This is
-  the main defense against broken or malicious clients.
-- **Sanity checks:** policy targets must be normalized and cover only legal moves, and the result distribution
-  for each network is compared against the server's own control games.
-- **Trainer:** the same `train/train_selfplay.py` loop and recipe as on one machine ([TRAINING.md](TRAINING.md)),
-  run whenever 100,000 new validated rows arrive.
-- **Gating:** a new network must win ≥ 100 of 200 games against the current one (KataGo App. E) before clients
-  receive it. The matches run as client match tasks.
-- **Publishing:** every network, the training data and the match results are public for download, as with Lc0.
+The server uses only the Python standard library. It needs the `rc0` engine and, for training, a Python with
+PyTorch.
+
+```bash
+python3 server/rc0_server.py init  --data server_data --random 15x192      # or --net existing.pt (+ .onnx)
+python3 server/rc0_server.py serve --data server_data --port 8000
+```
+
+Put it behind a reverse proxy with HTTPS (for example Caddy) to serve it publicly. `server_data/config.json`
+holds every setting: self-play arguments, rows per generation, gate size and so on.
+
+- **Validation.** Every upload is replayed by `rc0 validate` before it is accepted. Every move must be legal,
+  and every training row must be the position it claims to be, with the right history, rules-derived labels,
+  game result, plies-left and material targets. Policy targets may cover only legal moves and must sum to 1.
+  Games that ended by the rules must have the result the rules give. Uploads that fail are rejected and
+  counted against the contributor.
+- **Data.** Accepted chunks are appended to `data/gen<N>/` in the same row format the single-machine trainer
+  reads.
+- **Training.** Every `rows_per_generation` new rows (default 100,000), the server retrains with
+  `train/train_selfplay.py`. It uses the KataGo window and reuse rule and warm-starts from the current network.
+- **Gating.** The new network is a *candidate* until clients have played `gate_games` games (default 200)
+  against the current one at 300 playouts. It is promoted only if it scores at least 50% (KataGo, App. E).
+  If it fails, training continues on more data.
+- **Status.** `/` shows a status page (generation, games, contributors, gates). `/api/status` returns the
+  same data as JSON.
 
 ## Formats
 
-- **Network:** TorchScript `.pt`. Each client builds its own TensorRT `.plan` locally, because plans are
-  specific to a GPU and TensorRT version. Networks are addressed by sha256.
-- **Training chunk:** the self-play files described in [ARCHITECTURE.md](ARCHITECTURE.md) plus `games.txt`
-  (one line per game: start FEN4, moves, result). A version byte comes first so the format can change later.
+- **Network:** the server keeps TorchScript `.pt` files for training and serves `.onnx` files to clients.
+  Both are named by the SHA-256 of the `.onnx` file.
+- **Upload:** a `.tar.gz` containing `games.txt` and the `sp_*.bin` files
+  (see [ARCHITECTURE.md](ARCHITECTURE.md)). `games.txt` has one line per game, tab-separated: the start
+  FEN4, the number of random opening plies, the ply cap, how the game ended (natural, capped or adjudicated),
+  the result, every move, and the ply of each recorded training row.
 
-## Order of work
+## Testing
 
-1. Game records in self-play output (`games.txt`), plus a `validate` command in the engine that replays a chunk.
-2. Server: tasks, network hosting, upload and validation, with the trainer reading validated chunks.
-3. Client: download, self-play, upload, and automatic updates.
-4. Match tasks for gating and the public Elo graph.
-5. A public dashboard for contributors and networks.
+`tests/test_distributed.sh` runs the whole loop on one machine, on the CPU, with a tiny network. It starts a
+server, runs self-play tasks through the client, trains a candidate, plays the gate through the client, and
+then promotes or rejects the candidate.
 
-Help is welcome with any of these steps. Please open an issue first.
+## Planned next
+
+- Elo graph from the gate matches.
+- Automatic client updates.
+- Spot re-play of a random sample of uploads on the server, to catch clients that report fake search
+  values.

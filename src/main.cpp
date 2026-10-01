@@ -6,6 +6,7 @@
 //   zero bench [net] [P]      playouts/s of the search (+ net if given)
 //   zero selfplay --net F --games N --threads T --playouts P [--out DIR]  batched multi-game self-play
 //   zero tables               rotation/geometry tables as JSON
+//   zero validate DIR [-v] [--games-only]   replay every game in a self-play directory and check every training row
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -35,20 +36,32 @@ namespace zero {
 std::unique_ptr<Evaluator> make_trt_evaluator(const std::string&, int) { return nullptr; }
 }
 #endif
+#ifndef ZERO_HAVE_ONNX
+namespace zero {
+std::unique_ptr<Evaluator> make_onnx_evaluator(const std::string&, int) { return nullptr; }
+}
+#endif
 
 namespace zero {
-// backend selection lives HERE because only this target sees ZERO_HAVE_TORCH / ZERO_HAVE_TRT; zerocore
-// does not. ZERO_BACKEND=trt refuses to fall back, so a gate cannot silently measure LibTorch twice and call
-// it a TensorRT result - which is exactly the mistake that would make the whole measurement worthless.
+// Backend selection lives here because only this target knows which backends were built.
+//   a .onnx path        -> ONNX Runtime
+//   otherwise           -> TensorRT (if a matching .plan exists), then LibTorch, then the .onnx sibling
+// ZERO_BACKEND=trt|torch|onnx forces one backend and refuses to fall back, so a measurement can never
+// silently test a different backend than the one it names.
 std::unique_ptr<Evaluator> make_evaluator(const std::string& path, int maxBatch) {
-    const char* want = std::getenv("ZERO_BACKEND");
-    const bool forceTorch = want && std::string(want) == "torch";
-    const bool forceTrt   = want && std::string(want) == "trt";
-    if (!forceTorch) {
-        if (auto e = make_trt_evaluator(path, maxBatch)) return e;
-        if (forceTrt) { std::printf("FATAL ZERO_BACKEND=trt but no TensorRT evaluator could be made\n"); return nullptr; }
+    const char* w = std::getenv("ZERO_BACKEND");
+    const std::string want = w ? w : "";
+    const bool isOnnx = path.size() > 5 && path.substr(path.size() - 5) == ".onnx";
+    if (want == "trt" || want == "torch" || want == "onnx") {
+        auto e = want == "trt" ? make_trt_evaluator(path, maxBatch)
+               : want == "torch" ? make_torch_evaluator(path, maxBatch) : make_onnx_evaluator(path, maxBatch);
+        if (!e) std::printf("FATAL ZERO_BACKEND=%s but that backend could not load %s\n", want.c_str(), path.c_str());
+        return e;
     }
-    return make_torch_evaluator(path, maxBatch);
+    if (isOnnx) return make_onnx_evaluator(path, maxBatch);
+    if (auto e = make_trt_evaluator(path, maxBatch)) return e;
+    if (auto e = make_torch_evaluator(path, maxBatch)) return e;
+    return make_onnx_evaluator(path, maxBatch);
 }
 }  // namespace zero
 #include "selfplay.h"
@@ -105,7 +118,7 @@ static int selfplay_test(int games, int playouts) {
 
 static int bench(const std::string& net, int playouts) {
     std::unique_ptr<Evaluator> raw;
-    if (!net.empty()) raw = make_torch_evaluator(net, 256);
+    if (!net.empty()) raw = make_evaluator(net, 256);
     if (!raw) raw = std::make_unique<UniformEvaluator>();
     CachedEvaluator cached(*raw, 18);
     SearchParams sp;
@@ -258,6 +271,11 @@ int main(int argc, char** argv) {
         std::printf("encode-probe: %d samples -> %s (%d planes, %d cells, %zu bytes/sample)\n",
                     written, argv[3], N_PLANES, CELLS, size_t(REC_BYTES + HIST_POS * REC_BYTES + 1 + INPUT_FLOATS * 4));
         return 0;
+    }
+    if (argc >= 3 && std::string(argv[1]) == "validate") {   // replay-check a self-play directory (distributed uploads)
+        bool verbose = false, gamesOnly = false;
+        for (int i = 3; i < argc; i++) { verbose |= std::string(argv[i]) == "-v"; gamesOnly |= std::string(argv[i]) == "--games-only"; }
+        return validate_main(argv[2], verbose, gamesOnly);
     }
     if (argc >= 2 && std::string(argv[1]) == "tables") return tables();
     if (argc >= 3 && std::string(argv[1]) == "encode-dump") {  // fen4 -> "plane cell value" lines + legal policy indices

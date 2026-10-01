@@ -116,6 +116,17 @@ def export_torchscript(net: ZeroNet, path: str):
     return path
 
 
+def export_onnx(net: ZeroNet, path: str):
+    """Portable export for the ONNX Runtime backend (release downloads, Windows/DirectML, CPU).
+    Dynamic batch; input "planes" [B,C,14,14] float32; outputs "policy", "wdl", "moves_left"."""
+    net = net.eval().float().to("cpu")
+    ex = torch.zeros(1, getattr(net, "in_planes", N_PLANES), BOARD, BOARD)
+    torch.onnx.export(net, ex, path, input_names=["planes"], output_names=["policy", "wdl", "moves_left"],
+                      dynamic_axes={"planes": {0: "batch"}, "policy": {0: "batch"}, "wdl": {0: "batch"}, "moves_left": {0: "batch"}},
+                      opset_version=17, dynamo=False)
+    return path
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="export a random-init net (Stage 0 backend smoke test)")
@@ -126,4 +137,6 @@ if __name__ == "__main__":
     net = ZeroNet(a.blocks, a.filters)
     n = sum(p.numel() for p in net.parameters())
     export_torchscript(net, a.out)
+    if a.out.endswith(".pt"):
+        export_onnx(net, a.out[:-3] + ".onnx")
     print(f"exported {a.blocks}x{a.filters} ({n:,} params) to {a.out}")

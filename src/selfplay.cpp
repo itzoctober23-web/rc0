@@ -39,6 +39,8 @@ struct Rec { unsigned char rec[136]; int16_t polIdx[96]; uint16_t polP[96]; floa
              unsigned char hist[HIST_POS * REC_BYTES]; unsigned char nhist;
              unsigned char aux[AUX_BYTES]; };   // input history: the HIST_POS positions before this one, newest first; rules-only aux labels
 
+}  // namespace
+
 // final material balance, RY minus BG, pawn units (P1 N3 B5 R5 Q9; kings excluded), clamped to int8
 int8_t material_ry(const Position& p) {
     static const int val[] = {1, 3, 5, 5, 9, 0};
@@ -52,6 +54,8 @@ int8_t material_ry(const Position& p) {
     return int8_t(std::max(-127, std::min(127, m)));
 }
 
+namespace {
+
 
 uint16_t f16(float f) {  // float -> IEEE half (round to nearest), enough for probabilities
     uint32_t x; std::memcpy(&x, &f, 4);
@@ -63,16 +67,18 @@ uint16_t f16(float f) {  // float -> IEEE half (round to nearest), enough for pr
 
 struct Writer {
     std::mutex mu;
-    FILE *fr = nullptr, *fp = nullptr, *fres = nullptr, *fq = nullptr, *fply = nullptr, *fmat = nullptr, *fhist = nullptr, *faux = nullptr;
+    FILE *fgames = nullptr, *fr = nullptr, *fp = nullptr, *fres = nullptr, *fq = nullptr, *fply = nullptr, *fmat = nullptr, *fhist = nullptr, *faux = nullptr;
     bool open(const std::string& dir) {
         auto op = [&](const char* n) { return std::fopen((dir + "/" + n).c_str(), "ab"); };
         fr = op("sp_rec.bin"); fp = op("sp_pol.bin"); fres = op("sp_res.bin"); fq = op("sp_q.bin"); fply = op("sp_ply.bin"); fmat = op("sp_mat.bin");
         fhist = op("sp_hist.bin");   // input history side file
         faux = op("sp_aux.bin");     // side file, same backward-compatible pattern
-        return fr && fp && fres && fq && fply && fmat && fhist && faux;
+        fgames = std::fopen((dir + "/games.txt").c_str(), "a");   // one line per game, in row order (see validate.cpp)
+        return fgames && fr && fp && fres && fq && fply && fmat && fhist && faux;
     }
-    void write_game(const std::vector<Rec>& recs, int8_t result, int8_t mat) {
+    void write_game(const std::vector<Rec>& recs, int8_t result, int8_t mat, const std::string& gameLine) {
         std::lock_guard<std::mutex> lk(mu);
+        std::fputs(gameLine.c_str(), fgames); std::fputc('\n', fgames); std::fflush(fgames);
         int n = int(recs.size());
         for (int i = 0; i < n; i++) {
             std::fwrite(recs[i].rec, 1, 136, fr);
@@ -87,7 +93,7 @@ struct Writer {
         }
         std::fflush(fr); std::fflush(fp); std::fflush(fres); std::fflush(fq); std::fflush(fply); std::fflush(fmat); std::fflush(fhist); std::fflush(faux);
     }
-    void close() { for (FILE* f : {fr, fp, fres, fq, fply, fmat, fhist, faux}) if (f) std::fclose(f); }
+    void close() { for (FILE* f : {fgames, fr, fp, fres, fq, fply, fmat, fhist, faux}) if (f) std::fclose(f); }
 };
 }  // namespace
 
@@ -132,12 +138,18 @@ int selfplay_main(const SelfplayOpts& o) {
                 sp.forcedPlayouts = o.forcedPlayouts;   // , self-play only
                 Position pos;
                 if (int(rng() % 100) < o.c960pct) pos.init_startpos960(rng()); else pos.init_startpos();
+                const std::string startFen = pos.fen4();   // game record (games.txt): start, every move, how it ended
+                std::string moveList;
+                int nrand = 0;
                 int rp = int(rng() % (o.randomPlies + 1));
                 for (int i = 0; i < rp; i++) {
                     Move list[MAX_MOVES]; int n = generate_legal(pos, list);
                     bool over = false; game_result(pos, over);
                     if (over || n == 0) break;
-                    pos.do_move(list[rng() % n]);
+                    Move rm = list[rng() % n];
+                    moveList += (moveList.empty() ? "" : " ") + Position::move_str(rm);
+                    pos.do_move(rm);
+                    nrand++;
                 }
                 Mcts mcts(ev, sp);
                 mcts.set_root(pos);
@@ -147,11 +159,12 @@ int selfplay_main(const SelfplayOpts& o) {
                 GameResult gr = ONGOING;
                 int ply = 0;
                 int adjStreak = 0, adjSign = 0, adjResult = 0; bool adjudicated = false, verifying = false;
+                const char* endReason = "stopped";   // natural | capped | adjudicated | stopped (never written)
                 while (!stopFlag.load()) {
                     bool over = false;
                     gr = game_result(pos, over);
-                    if (over) break;
-                    if (ply >= o.maxPlies) { gr = ONGOING; break; }
+                    if (over) { endReason = "natural"; break; }
+                    if (ply >= o.maxPlies) { gr = ONGOING; endReason = "capped"; break; }
                     bool full = int(rng() % 100) < o.fullPct;
                     int po = full ? o.playouts : o.fastPlayouts;
                     mcts.set_root_noise(o.noise && ply < o.noisePlies);
@@ -161,7 +174,7 @@ int selfplay_main(const SelfplayOpts& o) {
                     if (o.gumbel > 0) m = mcts.gumbel_search(po, o.gumbel, target);
                     else { mcts.run(po); m = mcts.select_move(ply < o.tempPlies ? 1.0f : 0.0f); }
                     RootStats rs = mcts.root_stats();
-                    if (m == MOVE_NONE) break;
+                    if (m == MOVE_NONE) { endReason = "error"; break; }
                     // "self-play training targets for proven positions use the proven value".
                     // Where the RULES settle the position, the value target is the proof, not the search's
                     // estimate of it - and the adjudicator below should trust a proof completely.
@@ -203,12 +216,13 @@ int selfplay_main(const SelfplayOpts& o) {
                     if (!adjudicated && ply >= o.adjMinPly && adjStreak >= o.adjPlies) {
                         adjudicated = true; adjResult = sgn; adjTotal++;
                         if (int(rng() % 100) < o.verifyPct) verifying = true;
-                        else { gr = sgn > 0 ? TEAM_RY_WINS : TEAM_BG_WINS; break; }
+                        else { gr = sgn > 0 ? TEAM_RY_WINS : TEAM_BG_WINS; endReason = "adjudicated"; break; }
                     }
                     // push the position we just left onto the ring (newest first) before advancing
                     if (HIST_POS > 1) std::memmove(ring + REC_BYTES, ring, size_t(HIST_POS - 1) * REC_BYTES);
                     fill_record(pos, ring);
                     if (nring < HIST_POS) nring++;
+                    moveList += (moveList.empty() ? "" : " ") + Position::move_str(m);
                     pos.do_move(m);
                     mcts.apply_move(m);
                     ply++;
@@ -219,13 +233,19 @@ int selfplay_main(const SelfplayOpts& o) {
                 if (gr == ONGOING) { capped++; draws++; }           // ply cap: written as a draw
                 else if (gr == TEAM_RY_WINS) ry++; else if (gr == TEAM_BG_WINS) bg++; else draws++;
                 if (verifying) { if (gr == ONGOING) adjUnresolved++; else { adjVerified++; if (result != adjResult) adjWrong++; } }
-                if (writing && !recs.empty()) {
+                // A game cut off by --seconds or a stop has no honest result, so it is not written at all.
+                const bool complete = std::strcmp(endReason, "stopped") != 0 && std::strcmp(endReason, "error") != 0;
+                if (writing && complete) {
                     for (Rec& r : recs) {
                         r.pliesLeft = ply - r.ply;
                         float qry = team_of(Color(r.rec[0])) == 0 ? r.q : -r.q;
                         if (result != 0) { valN++; if ((qry > 0) == (result > 0)) valCorrect++; }   // decisive rows only (draws made it read 22% at gen 1)
                     }
-                    writer.write_game(recs, result, material_ry(pos));
+                    std::string rows;
+                    for (const Rec& r : recs) rows += (rows.empty() ? "" : ",") + std::to_string(r.ply);
+                    std::string line = startFen + "\t" + std::to_string(nrand) + "\t" + std::to_string(o.maxPlies) + "\t" +
+                                       endReason + "\t" + std::to_string(int(result)) + "\t" + moveList + "\t" + rows;
+                    writer.write_game(recs, result, material_ry(pos), line);
                     recorded += recs.size();
                 }
                 gamesDone++;
