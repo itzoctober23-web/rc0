@@ -1,0 +1,9 @@
+build*/
+.tmp/
+runs/
+*.pt
+*.ckpt
+*.plan
+*.plan.meta
+__pycache__/
+*.pyc
