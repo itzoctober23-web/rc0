@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "encoding.h"
+#include <algorithm>
 #include <cstring>
 #include "geometry.h"
 #include "movegen.h"
@@ -176,6 +177,19 @@ LegalSet legal_with_index(Position& pos) {
     ls.idx.resize(n);
     for (int i = 0; i < n; i++) ls.idx[i] = policy_index(pos, list[i]);
     return ls;
+}
+
+// final material balance, RY minus BG, pawn units (P1 N3 B5 R5 Q9; kings excluded), clamped to int8
+int8_t material_ry(const quad::Position& p) {
+    static const int val[] = {1, 3, 5, 5, 9, 0};
+    int m = 0;
+    for (int sq = 0; sq < quad::SQUARE_NB; sq++) {
+        quad::Piece pc = p.piece_on(sq);
+        if (pc == quad::NO_PIECE) continue;
+        int v = val[int(quad::type_of(pc))];
+        m += (quad::team_of(quad::color_of(pc)) == 0) ? v : -v;
+    }
+    return int8_t(std::max(-127, std::min(127, m)));
 }
 
 }  // namespace zero

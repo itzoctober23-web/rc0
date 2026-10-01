@@ -39,22 +39,6 @@ struct Rec { unsigned char rec[136]; int16_t polIdx[96]; uint16_t polP[96]; floa
              unsigned char hist[HIST_POS * REC_BYTES]; unsigned char nhist;
              unsigned char aux[AUX_BYTES]; };   // input history: the HIST_POS positions before this one, newest first; rules-only aux labels
 
-}  // namespace
-
-// final material balance, RY minus BG, pawn units (P1 N3 B5 R5 Q9; kings excluded), clamped to int8
-int8_t material_ry(const Position& p) {
-    static const int val[] = {1, 3, 5, 5, 9, 0};
-    int m = 0;
-    for (int sq = 0; sq < SQUARE_NB; sq++) {
-        Piece pc = p.piece_on(sq);
-        if (pc == NO_PIECE) continue;
-        int v = val[int(type_of(pc))];
-        m += (team_of(color_of(pc)) == 0) ? v : -v;
-    }
-    return int8_t(std::max(-127, std::min(127, m)));
-}
-
-namespace {
 
 
 uint16_t f16(float f) {  // float -> IEEE half (round to nearest), enough for probabilities

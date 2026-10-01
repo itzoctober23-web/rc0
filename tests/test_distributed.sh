@@ -17,7 +17,7 @@ trap 'kill $SRV 2>/dev/null || true; echo "workdir: $W"' EXIT
 "$PY" - "$W/srv/config.json" <<'EOF'
 import json, sys
 p = sys.argv[1]; c = json.load(open(p))
-c.update(games_per_task=6, rows_per_generation=150, gate_games=4, match_pairs_per_task=2, gate_playouts=16,
+c.update(invite_only=False, games_per_task=6, rows_per_generation=150, gate_games=4, match_pairs_per_task=2, gate_playouts=16,
          match_opening_plies=4, reuse=2, train_batch=32)
 c["selfplay_args"].update({"playouts": 24, "fast-playouts": 8, "full-pct": 50, "max-plies": 80, "adj-min-ply": 20})
 json.dump(c, open(p, "w"), indent=1)

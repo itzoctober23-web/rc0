@@ -376,8 +376,8 @@ bool Position::set_fen4(const std::string& fen) {
                 const int skipped = geo::parse_sq(two[0].c_str()), pawn = geo::parse_sq(two[1].c_str());
                 if (skipped != SQ_NONE && pawn != SQ_NONE) { s.epSq[c] = skipped; s.epPawn[c] = pawn; }
             }
-        } else if (i >= 5 && std::all_of(fd.begin(), fd.end(), [](char ch) { return std::isdigit((unsigned char)ch); })) {
-            s.rule50 = std::atoi(fd.c_str());
+        } else if (i >= 5 && fd.size() <= 4 && std::all_of(fd.begin(), fd.end(), [](char ch) { return std::isdigit((unsigned char)ch); })) {
+            s.rule50 = std::atoi(fd.c_str());   // at most 4 digits: no overflow from hostile input
         }
     }
 
@@ -391,8 +391,15 @@ bool Position::set_fen4(const std::string& fen) {
             for (char ch : raw)
                 if (!std::isspace((unsigned char)ch)) tok.push_back(ch);
             if (tok.empty()) continue;
-            if (tok == "x" || tok == "X") { f++; continue; }
-            if (std::isdigit((unsigned char)tok[0])) { f += std::atoi(tok.c_str()); continue; }
+            if (tok == "x" || tok == "X") { if (++f > FILE_NB) return false; continue; }
+            if (std::isdigit((unsigned char)tok[0])) {   // a run of empty squares: 1..14, digits only
+                if (tok.size() > 2 || !std::all_of(tok.begin(), tok.end(), [](char ch) { return std::isdigit((unsigned char)ch); }))
+                    return false;
+                const int run = std::atoi(tok.c_str());
+                if (run < 1 || f + run > FILE_NB) return false;
+                f += run;
+                continue;
+            }
             if (tok.size() < 2) continue;
             const int c = color_index(tok[0]), t = type_index(tok[1]);
             if (c < 0 || t < 0 || f >= FILE_NB || geo::SQ[f][r] == SQ_NONE) return false;
@@ -402,7 +409,7 @@ bool Position::set_fen4(const std::string& fen) {
         if (f != FILE_NB) return false;
     }
     for (int c = 0; c < COLOR_NB; c++)
-        if (king_[c] == SQ_NONE) return false;
+        if (king_[c] == SQ_NONE || count_[c][KING] != 1) return false;   // exactly one king per army
 
     // Drop castling rights whose king or rook is not on its home square.
     for (int c = 0; c < COLOR_NB; c++)

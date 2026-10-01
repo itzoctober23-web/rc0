@@ -230,6 +230,7 @@ def main():
     ap = argparse.ArgumentParser(description="Rc0 training client")
     ap.add_argument("--server")
     ap.add_argument("--name", help="contributor name shown on the server's stats page")
+    ap.add_argument("--invite", help="invite code (needed once, if the server is invite-only)")
     ap.add_argument("--engine", default=None)
     ap.add_argument("--threads", type=int, default=None, help="concurrent self-play games (more = fuller GPU batches)")
     ap.add_argument("--ep", default=None, choices=["auto", "cuda", "dml", "cpu"], help="ONNX Runtime device")
@@ -254,7 +255,11 @@ def main():
 
     srv = Server(args.server, cfg.get("token") if cfg.get("server") == args.server else None)
     if not srv.token:
-        ans = srv.json("POST", "/api/register", {"name": args.name or platform.node() or "anonymous"})
+        try:
+            ans = srv.json("POST", "/api/register", {"name": args.name or platform.node() or "anonymous",
+                                                      "invite": args.invite or ""})
+        except urllib.error.HTTPError as e:
+            sys.exit(f"registration refused ({e.code}): {e.read().decode(errors='replace')[:200]}")
         srv.token = ans["token"]
         log(f"registered as {ans['name']}")
     cfg.update({"server": args.server, "name": args.name, "token": srv.token, "engine": args.engine,

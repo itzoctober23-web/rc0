@@ -9,7 +9,7 @@ checked by the server and becomes training data for the next network.
    and unzip it anywhere.
 2. Open a terminal in that folder (Shift + right-click → *Open in Terminal*) and run:
    ```
-   rc0-client.exe --server SERVER_ADDRESS --name YOUR_NAME
+   rc0-client.exe --server SERVER_ADDRESS --name YOUR_NAME --invite YOUR_INVITE_CODE
    ```
 3. Leave it running. Stop it any time with Ctrl+C. Next time, just run `rc0-client.exe`, because your settings
    are saved.
@@ -21,9 +21,12 @@ install drivers beyond your normal graphics driver.
 
 1. Download `rc0-linux-x64.tar.gz` from the [latest release](https://github.com/itzoctober23-web/rc0/releases/latest)
    and unpack it.
-2. Run `python3 rc0_client.py --server SERVER_ADDRESS --name YOUR_NAME` in that folder.
+2. Run `python3 rc0_client.py --server SERVER_ADDRESS --name YOUR_NAME --invite YOUR_INVITE_CODE` in that folder.
 
 The Linux build uses CUDA if CUDA 12 and cuDNN 9 are installed, and the CPU otherwise.
+
+While the project is new, the server is invite-only: ask the maintainer for an invite code. You only need it on
+the first run.
 
 ## Options
 

@@ -44,6 +44,15 @@ DEFAULT_CONFIG = {
     "task_timeout_s": 7200,
     "max_upload_mb": 400,
     "registrations_per_ip_per_hour": 5,
+    # hardening
+    "invite_only": True,               # registration needs a one-time invite code (rc0_server.py invite ...)
+    "uploads_per_token_per_hour": 30,
+    "max_data_gb": 50,                 # stop accepting uploads before the data folder outgrows this
+    "max_concurrent_validations": 2,
+    # "internal": this process trains and gates; "external": a trainer outside this server (for example the
+    # host, when the server runs in a container) publishes networks into the read-only inbox, and training
+    # data is read from data/ by that trainer
+    "trainer": "internal",
 }
 
 
@@ -60,8 +69,9 @@ def sha256_file(path):
 
 
 class Hub:
-    def __init__(self, data):
+    def __init__(self, data, inbox=None):
         self.data = os.path.abspath(data)
+        self.inbox = os.path.abspath(inbox) if inbox else None
         self.lock = threading.RLock()
         self.cfg = dict(DEFAULT_CONFIG)
         self.cfg.update(json.load(open(self.p("config.json"))))
@@ -69,6 +79,10 @@ class Hub:
         self.users = json.load(open(self.p("users.json"))) if os.path.exists(self.p("users.json")) else {}
         self.tasks = {}
         self.reg_log = []
+        self.upload_log = {}
+        self.validations = threading.BoundedSemaphore(self.cfg["max_concurrent_validations"])
+        self.state.setdefault("used_invites", [])
+        self.state.setdefault("data_bytes", 0)
         self.log_f = open(self.p("server.log"), "a")
 
     def p(self, *a):
@@ -92,8 +106,24 @@ class Hub:
         return {"sha256": sha, "onnx": f"/networks/{sha}.onnx"}
 
     # ------------------------------------------------------------ users
-    def register(self, name, ip):
+    def invites(self):
+        """One-time invite codes, written by the operator into the inbox (or data dir) as invites.json."""
+        for d in (self.inbox, self.data):
+            if d and os.path.isfile(os.path.join(d, "invites.json")):
+                try:
+                    return json.load(open(os.path.join(d, "invites.json")))
+                except ValueError:
+                    return {}
+        return {}
+
+    def register(self, name, ip, invite=""):
         with self.lock:
+            if self.cfg["invite_only"]:
+                inv = self.invites()
+                if not invite or invite not in inv or invite in self.state["used_invites"]:
+                    return None
+                self.state["used_invites"].append(invite)
+                name = inv[invite] or name
             t = time.time()
             self.reg_log = [(i, s) for i, s in self.reg_log if t - s < 3600]
             if sum(1 for i, _ in self.reg_log if i == ip) >= self.cfg["registrations_per_ip_per_hour"]:
@@ -110,6 +140,8 @@ class Hub:
         if version < MIN_CLIENT_VERSION:
             return {"type": "upgrade", "message": "download the newest client from the Rc0 releases page"}
         with self.lock:
+            if not self.state.get("current"):
+                return {"type": "wait", "seconds": 60}   # no network published yet
             t = time.time()
             self.tasks = {k: v for k, v in self.tasks.items() if t - v["issued"] < self.cfg["task_timeout_s"]}
             cand = self.state.get("candidate")
@@ -151,7 +183,22 @@ class Hub:
                     break
         return {"valid": False, "reason": "validator gave no verdict"}
 
+    def allow_upload(self, token):
+        with self.lock:
+            t = time.time()
+            log = [x for x in self.upload_log.get(token, []) if t - x < 3600]
+            if len(log) >= self.cfg["uploads_per_token_per_hour"]:
+                self.upload_log[token] = log
+                return False
+            log.append(t)
+            self.upload_log[token] = log
+            return True
+
     def accept_selfplay(self, token, tid, body):
+        if self.state["data_bytes"] > self.cfg["max_data_gb"] * (1 << 30):
+            return 507, {"accepted": False, "reason": "server storage is full"}
+        if not self.allow_upload(token):
+            return 429, {"accepted": False, "reason": "too many uploads this hour"}
         task = self.take_task(tid, token, "selfplay")
         if not task:
             return 404, {"accepted": False, "reason": "unknown or expired task"}
@@ -169,7 +216,8 @@ class Hub:
                     src = tar.extractfile(m)
                     with open(os.path.join(tmp, m.name), "wb") as f:
                         shutil.copyfileobj(src, f)
-            v = self.validate(tmp)
+            with self.validations:
+                v = self.validate(tmp)
             user = self.users.get(token, {})
             if not v.get("valid"):
                 with self.lock:
@@ -181,6 +229,7 @@ class Hub:
                 gd = self.p("data", f"gen{task['gen']}")
                 os.makedirs(gd, exist_ok=True)
                 for name in SP_FILES + ["games.txt"]:
+                    self.state["data_bytes"] += os.path.getsize(os.path.join(tmp, name))
                     with open(os.path.join(tmp, name), "rb") as src, open(os.path.join(gd, name), "ab") as dst:
                         shutil.copyfileobj(src, dst)
                 user["games"] = user.get("games", 0) + v["games"]
@@ -199,6 +248,8 @@ class Hub:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def accept_match(self, token, tid, obj):
+        if not self.allow_upload(token):
+            return 429, {"accepted": False, "reason": "too many uploads this hour"}
         task = self.take_task(tid, token, "match")
         if not task:
             return 404, {"accepted": False, "reason": "unknown or expired task"}
@@ -214,7 +265,8 @@ class Hub:
                     if not re.fullmatch(r"[a-n0-9qrbn ]*", moves) or end not in ("natural", "capped"):
                         return 400, {"accepted": False, "reason": "malformed game"}
                     f.write(f"{self.state['start_fen']}\t0\t{cap}\t{end}\t{res}\t{moves}\t\n")
-            v = self.validate(tmp, games_only=True)
+            with self.validations:
+                v = self.validate(tmp, games_only=True)
             if not v.get("valid"):
                 self.log(f"REJECTED match upload: {v.get('reason')}")
                 return 422, {"accepted": False, "reason": v.get("reason")}
@@ -303,6 +355,33 @@ class Hub:
         shutil.copy2(pt, self.p("networks", sha + ".pt"))
         return sha
 
+    def inbox_loop(self):
+        """External trainer: the host publishes inbox/current.json {"sha256", "gen", "onnx": file name}."""
+        while True:
+            try:
+                p = os.path.join(self.inbox, "current.json")
+                if os.path.isfile(p):
+                    cur = json.load(open(p))
+                    sha, gen = str(cur["sha256"]), int(cur["gen"])
+                    if re.fullmatch(r"[0-9a-f]{64}", sha) and sha != self.state.get("current"):
+                        src = os.path.join(self.inbox, os.path.basename(str(cur["onnx"])))
+                        dst = self.p("networks", sha + ".onnx")
+                        shutil.copyfile(src, dst + ".tmp")
+                        if sha256_file(dst + ".tmp") != sha:
+                            os.remove(dst + ".tmp")
+                            self.log(f"inbox network does not match its sha256 {sha[:12]}; ignored")
+                        else:
+                            os.replace(dst + ".tmp", dst)
+                            with self.lock:
+                                self.state["gen"] = gen
+                                self.state["current"] = sha
+                                self.state["history"].append({"gen": gen, "sha": sha, "at": now(), "rows_total": self.state["rows_total"]})
+                                self.save()
+                            self.log(f"generation {gen} is now {sha[:12]} (from the external trainer)")
+            except (OSError, ValueError, KeyError) as e:
+                self.log(f"inbox error: {e!r}")
+            time.sleep(10)
+
     def trainer_loop(self):
         while True:
             time.sleep(10)
@@ -324,7 +403,9 @@ class Hub:
             st = self.state
             people = sorted(self.users.values(), key=lambda u: -u.get("games", 0))
             return {"generation": st["gen"], "network": st["current"], "games": st["games_total"], "rows": st["rows_total"],
-                    "results": st["results"], "rows_until_training": max(0, self.cfg["rows_per_generation"] - st["rows_since_train"]),
+                    "results": st["results"],
+                    "rows_until_training": (max(0, self.cfg["rows_per_generation"] - st["rows_since_train"])
+                                            if self.cfg["trainer"] == "internal" else None),
                     "training": st.get("training", False),
                     "candidate": ({"sha": st["candidate"]["sha"], "games": len(st["candidate"]["games"]),
                                    "score": sum(st["candidate"]["games"])} if st.get("candidate") else None),
@@ -345,7 +426,7 @@ table{{border-collapse:collapse;width:100%;margin:8px 0 24px}}td,th{{border-bott
 <table><tr><td>Generation</td><td>{gen}</td></tr><tr><td>Network</td><td><code>{net}</code></td></tr>
 <tr><td>Games / training rows</td><td>{games:,} / {rows:,}</td></tr>
 <tr><td>Results (Red+Yellow / Blue+Green / draw)</td><td>{ry:,} / {bg:,} / {dr:,}</td></tr>
-<tr><td>Next training in</td><td>{until:,} rows{training}</td></tr><tr><td>Gate</td><td>{cand}</td></tr></table>
+<tr><td>Next training in</td><td>{until}{training}</td></tr><tr><td>Gate</td><td>{cand}</td></tr></table>
 <h2>Contributors</h2><table><tr><th>Name</th><th>Games</th><th>Rows</th><th>Match games</th></tr>{people}</table>
 <h2>Gates</h2><table><tr><th>When</th><th>Candidate</th><th>Score</th><th>Result</th></tr>{gates}</table>
 </body></html>"""
@@ -359,7 +440,7 @@ def render(s):
                     f"<td>{'promoted' if g['passed'] else 'rejected'}</td></tr>" for g in reversed(s["gates"]))
     c = s["candidate"]
     return PAGE.format(gen=s["generation"], net=s["network"][:16], games=s["games"], rows=s["rows"], ry=s["results"].get("ry", 0),
-                       bg=s["results"].get("bg", 0), dr=s["results"].get("draw", 0), until=s["rows_until_training"],
+                       bg=s["results"].get("bg", 0), dr=s["results"].get("draw", 0), until=(f"{s['rows_until_training']:,} rows" if s["rows_until_training"] is not None else "the trainer runs separately"),
                        training=" (training now)" if s["training"] else "",
                        cand=f"<code>{c['sha'][:12]}</code> {c['score']}/{c['games']}" if c else "none running",
                        people=people, gates=gates)
@@ -368,6 +449,7 @@ def render(s):
 def make_handler(hub):
     class H(BaseHTTPRequestHandler):
         server_version = "rc0-server/1"
+        timeout = 60   # a slow or stalled client cannot hold a thread forever
 
         def log_message(self, fmt, *a):
             pass
@@ -423,9 +505,11 @@ def make_handler(hub):
             try:
                 if u.path == "/api/register":
                     obj = json.loads(self.body(4096) or b"{}")
-                    r = hub.register(str(obj.get("name", "")), self.client_address[0])
+                    ip = self.headers.get("CF-Connecting-IP") or self.client_address[0]   # behind Cloudflare Tunnel
+                    r = hub.register(str(obj.get("name", "")), ip, str(obj.get("invite", "")))
                     if not r:
-                        return self.send(429, {"error": "too many registrations from this address"})
+                        return self.send(403, {"error": "registration needs a valid invite code" if hub.cfg["invite_only"]
+                                               else "too many registrations from this address"})
                     return self.send(200, {"token": r[0], "name": r[1]})
                 tok = self.token()
                 if not tok:
@@ -454,15 +538,17 @@ def cmd_init(a):
         cfg["engine"] = os.path.abspath(a.engine)
     if a.python:
         cfg["python"] = a.python
+    if a.external:
+        cfg["trainer"] = "external"
     net = a.net
     if a.random:
         b, f = (int(x) for x in a.random.lower().split("x"))
         net = os.path.join(a.data, "training", "gen0.pt")
         subprocess.run([cfg["python"], os.path.join(ROOT, "train", "model.py"), "--blocks", str(b), "--filters", str(f), "--out", net], check=True)
-    if not net:
-        sys.exit("pass --net NET.pt (with NET.onnx next to it) or --random 15x192")
-    onnx = net[:-3] + ".onnx"
-    if not os.path.isfile(onnx):
+    if not net and not a.external:
+        sys.exit("pass --net NET.pt (with NET.onnx next to it), --random 15x192, or --external")
+    onnx = net[:-3] + ".onnx" if net else None
+    if onnx and not os.path.isfile(onnx):
         sys.exit(f"{onnx} not found: export it with train/export_best.py")
     out = subprocess.run([cfg["engine"]], input="position startpos\nd\nquit\n", stdout=subprocess.PIPE, text=True).stdout
     fen = [l.split(" ", 1)[1] for l in out.splitlines() if l.startswith("fen4 ")][0]
@@ -470,26 +556,43 @@ def cmd_init(a):
                  "results": {"ry": 0, "bg": 0, "draw": 0}, "candidate": None, "training": False, "history": [], "gates": []}
     with open(os.path.join(a.data, "config.json"), "w") as f:
         json.dump(cfg, f, indent=1)
-    sha = sha256_file(onnx)
-    shutil.copy2(onnx, os.path.join(a.data, "networks", sha + ".onnx"))
-    shutil.copy2(net, os.path.join(a.data, "networks", sha + ".pt"))
-    hub_state["current"] = sha
-    hub_state["history"].append({"gen": 0, "sha": sha, "at": now(), "rows_total": 0})
+    if onnx:
+        sha = sha256_file(onnx)
+        shutil.copy2(onnx, os.path.join(a.data, "networks", sha + ".onnx"))
+        shutil.copy2(net, os.path.join(a.data, "networks", sha + ".pt"))
+        hub_state["current"] = sha
+        hub_state["history"].append({"gen": 0, "sha": sha, "at": now(), "rows_total": 0})
     with open(os.path.join(a.data, "state.json"), "w") as f:
         json.dump(hub_state, f, indent=1)
-    print(f"initialised {a.data}: generation 0 = {sha[:12]}; edit config.json, then run `serve`")
+    print(f"initialised {a.data} ({cfg['trainer']} trainer); edit config.json, then run `serve`")
 
 
 def cmd_serve(a):
-    hub = Hub(a.data)
+    hub = Hub(a.data, a.inbox)
     hub.state["training"] = False
-    threading.Thread(target=hub.trainer_loop, daemon=True).start()
+    if hub.cfg["trainer"] == "external":
+        if not hub.inbox:
+            sys.exit("an external-trainer server needs --inbox DIR")
+        threading.Thread(target=hub.inbox_loop, daemon=True).start()
+    else:
+        threading.Thread(target=hub.trainer_loop, daemon=True).start()
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(hub))
     hub.log(f"serving generation {hub.state['gen']} on {a.host}:{a.port}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         hub.save()
+
+
+def cmd_invite(a):
+    inv = json.load(open(a.file)) if os.path.isfile(a.file) else {}
+    code = secrets.token_urlsafe(9)
+    inv[code] = re.sub(r"[^A-Za-z0-9_.\- ]", "", a.name)[:32]
+    tmp = a.file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(inv, f, indent=1)
+    os.replace(tmp, a.file)
+    print(f"invite code for {inv[code]}: {code}")
 
 
 def main():
@@ -501,12 +604,17 @@ def main():
     i.add_argument("--random", help="start from a random network, e.g. 15x192")
     i.add_argument("--engine")
     i.add_argument("--python")
+    i.add_argument("--external", action="store_true", help="training happens outside this server (see --inbox)")
     s = sub.add_parser("serve")
     s.add_argument("--data", required=True)
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--inbox", help="read-only folder where an external trainer publishes networks and invites")
+    v = sub.add_parser("invite", help="create a one-time invite code")
+    v.add_argument("--file", required=True, help="invites.json (in the inbox, or the data folder)")
+    v.add_argument("--name", required=True)
     a = ap.parse_args()
-    (cmd_init if a.cmd == "init" else cmd_serve)(a)
+    {"init": cmd_init, "serve": cmd_serve, "invite": cmd_invite}[a.cmd](a)
 
 
 if __name__ == "__main__":

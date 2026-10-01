@@ -4,8 +4,6 @@
 #include <string>
 #include "position.h"
 namespace zero {
-// final material balance, Red+Yellow minus Blue+Green, pawn units (P1 N3 B5 R5 Q9), clamped to int8
-int8_t material_ry(const quad::Position& p);
 struct SelfplayOpts {
     std::string net, out;
     int games = 100, threads = 32, playouts = 128, maxPlies = 600, tempPlies = 20, randomPlies = 8, c960pct = 20;

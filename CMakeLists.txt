@@ -35,7 +35,7 @@ target_compile_options(rc0rules PRIVATE ${RC0_WARN})
 target_link_libraries(rc0rules PUBLIC Threads::Threads)
 
 # ---- engine core: input encoding + MCTS, independent of any NN library ----
-add_library(rc0core STATIC src/encoding.cpp src/mcts.cpp src/uci4.cpp)
+add_library(rc0core STATIC src/encoding.cpp src/mcts.cpp src/uci4.cpp src/validate.cpp)
 target_include_directories(rc0core PUBLIC src)
 target_link_libraries(rc0core PUBLIC rc0rules)
 target_compile_options(rc0core PRIVATE ${RC0_WARN})
@@ -112,7 +112,7 @@ if(RC0_ONNX AND ONNXRUNTIME_DIR)
   endif()
 endif()
 
-add_executable(rc0 src/main.cpp src/selfplay.cpp src/validate.cpp ${RC0_BACKEND_SRC})
+add_executable(rc0 src/main.cpp src/selfplay.cpp ${RC0_BACKEND_SRC})
 target_link_libraries(rc0 PRIVATE rc0core)
 if(Torch_FOUND)
   target_link_libraries(rc0 PRIVATE torchwheel)

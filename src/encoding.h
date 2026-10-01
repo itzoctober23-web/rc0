@@ -97,4 +97,8 @@ struct LegalSet {
 };
 LegalSet legal_with_index(quad::Position& pos);
 
+// Final material balance, Red+Yellow minus Blue+Green, pawn units (P1 N3 B5 R5 Q9), clamped to int8
+// (an auxiliary training target; the validator recomputes it).
+int8_t material_ry(const quad::Position& p);
+
 }  // namespace zero
